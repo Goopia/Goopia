@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract GoopiaStaking is ReentrancyGuard, Pausable, AccessControl {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    // 역할 정의
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+
+    // GT 토큰 컨트랙트
+    IERC20 public immutable gtToken;
+
+    // 스테이킹 상수
+    uint256 public constant MIN_STAKE_AMOUNT = 20000 * 10**18; // 20,000 GT
+    uint256 public constant MAX_STAKE_AMOUNT = 21000000 * 10**18; // 21,000,000 GT
+    uint256 public constant MIN_STAKING_PERIOD = 14 days;
+    uint256 public constant WITHDRAWAL_DELAY = 24 hours;
+    uint256 public constant APY = 11; // 11%
+    uint256 public constant DAILY_WITHDRAWAL_LIMIT = 21000000 * 10**18; // 21,000,000 GT
+
+    // 전체 스테이킹 금액
+    uint256 public totalStaked;
+
+    // 스테이킹 정보 구조체
+    struct StakeInfo {
+        uint256 amount;
+        uint256 startTime;
+        uint256 lastRewardTime;
+        uint256 pendingRewards;
+        bool isWithdrawing;
+        uint256 withdrawalRequestTime;
+        uint256 lastWithdrawalTime;
+        uint256 dailyWithdrawnAmount;
+    }
+
+    // 사용자별 스테이킹 정보
+    mapping(address => StakeInfo) public stakes;
+
+    // 이벤트
+    event Staked(address indexed user, uint256 amount, uint256 timestamp);
+    event WithdrawalRequested(address indexed user, uint256 amount, uint256 timestamp);
+    event Withdrawn(address indexed user, uint256 amount, uint256 rewards, uint256 timestamp);
+    event RewardsClaimed(address indexed user, uint256 rewards, uint256 timestamp);
+    event EmergencyWithdrawn(address indexed user, uint256 amount, uint256 rewards, address indexed admin, uint256 timestamp);
+    event RewardsDeposited(address indexed admin, uint256 amount, uint256 timestamp);
+    event RewardsWithdrawn(address indexed admin, uint256 amount, uint256 timestamp);
+
+    constructor(address _gtToken) {
+        require(_gtToken != address(0), "Invalid token address");
+        gtToken = IERC20(_gtToken);
+
+        // 역할 설정
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(EMERGENCY_ROLE, msg.sender);
+    }
+
+    // 전체 스테이킹 금액 반환
+    function getTotalStaked() public view returns (uint256) {
+        return totalStaked;
+    }
+
+    // 스테이킹 함수
+    function stake(uint256 _amount) external nonReentrant whenNotPaused {
+        require(_amount >= MIN_STAKE_AMOUNT, "Amount below minimum");
+        require(_amount <= MAX_STAKE_AMOUNT, "Amount above maximum");
+        require(stakes[msg.sender].amount == 0, "Already staking");
+
+        // 보류 중인 보상이 있다면 먼저 청구
+        if (stakes[msg.sender].pendingRewards > 0) {
+            _claimRewards();
+        }
+
+        // 토큰 전송
+        gtToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        // 스테이킹 정보 업데이트
+        stakes[msg.sender] = StakeInfo({
+            amount: _amount,
+            startTime: block.timestamp,
+            lastRewardTime: block.timestamp,
+            pendingRewards: 0,
+            isWithdrawing: false,
+            withdrawalRequestTime: 0,
+            lastWithdrawalTime: 0,
+            dailyWithdrawnAmount: 0
+        });
+
+        // 총 스테이킹 금액 증가
+        totalStaked = totalStaked.add(_amount);
+
+        emit Staked(msg.sender, _amount, block.timestamp);
+    }
+
+    // 보상 계산 함수
+    function calculateRewards(address _user) public view returns (uint256) {
+        StakeInfo memory stakeInfo = stakes[_user];
+        if (stakeInfo.amount == 0) return 0;
+
+        uint256 timeElapsed;
+        if (stakeInfo.isWithdrawing) {
+            // 출금 요청 시점까지만 보상 계산
+            timeElapsed = stakeInfo.withdrawalRequestTime.sub(stakeInfo.lastRewardTime);
+        } else {
+            timeElapsed = block.timestamp.sub(stakeInfo.lastRewardTime);
+        }
+
+        // 최소 스테이킹 기간 미달시 보상 없음
+        if (timeElapsed < MIN_STAKING_PERIOD) {
+            return 0;
+        }
+
+        uint256 rewards = stakeInfo.amount.mul(APY).mul(timeElapsed).div(365 days).div(100);
+        return stakeInfo.pendingRewards.add(rewards);
+    }
+
+    // 보상 청구 함수
+    function claimRewards() external nonReentrant whenNotPaused {
+        StakeInfo storage stakeInfo = stakes[msg.sender];
+        require(!stakeInfo.isWithdrawing, "Cannot claim rewards while withdrawing");
+        _claimRewards();
+    }
+
+    function _claimRewards() internal {
+        uint256 rewards = calculateRewards(msg.sender);
+        require(rewards > 0, "No rewards to claim");
+
+        // 보상 상태 업데이트를 토큰 전송 전에 수행
+        stakes[msg.sender].pendingRewards = 0;
+        stakes[msg.sender].lastRewardTime = block.timestamp;
+
+        // 토큰 전송
+        gtToken.safeTransfer(msg.sender, rewards);
+        emit RewardsClaimed(msg.sender, rewards, block.timestamp);
+    }
+
+    // 출금 요청 함수
+    function requestWithdrawal() external nonReentrant whenNotPaused {
+        StakeInfo storage stakeInfo = stakes[msg.sender];
+        require(stakeInfo.amount > 0, "No stake found");
+        require(!stakeInfo.isWithdrawing, "Already withdrawing");
+        require(
+            block.timestamp >= stakeInfo.startTime.add(MIN_STAKING_PERIOD),
+            "Minimum staking period not met"
+        );
+
+        // 보상 계산 및 업데이트
+        uint256 rewards = calculateRewards(msg.sender);
+        
+        // 상태 업데이트를 토큰 전송 전에 수행
+        stakeInfo.isWithdrawing = true;
+        stakeInfo.withdrawalRequestTime = block.timestamp;
+        stakeInfo.pendingRewards = rewards;
+        stakeInfo.lastRewardTime = block.timestamp;
+
+        emit WithdrawalRequested(msg.sender, stakeInfo.amount, block.timestamp);
+    }
+
+    // 컨트랙트 잔고 확인 함수
+    function checkContractBalance() public view returns (uint256) {
+        return gtToken.balanceOf(address(this));
+    }
+
+    // 출금 가능 여부 확인 함수
+    function canProcessWithdrawal(uint256 amount, uint256 rewards) internal view returns (bool) {
+        uint256 contractBalance = checkContractBalance();
+        return contractBalance >= amount.add(rewards);
+    }
+
+    // 출금 실행 함수
+    function withdraw() external nonReentrant whenNotPaused {
+        StakeInfo storage stakeInfo = stakes[msg.sender];
+        require(stakeInfo.isWithdrawing, "No withdrawal requested");
+        require(
+            block.timestamp >= stakeInfo.withdrawalRequestTime.add(WITHDRAWAL_DELAY),
+            "Withdrawal delay not met"
+        );
+
+        // 일일 출금 한도 확인
+        if (block.timestamp.sub(stakeInfo.lastWithdrawalTime) >= 1 days) {
+            stakeInfo.dailyWithdrawnAmount = 0;
+        }
+        require(
+            stakeInfo.dailyWithdrawnAmount.add(stakeInfo.amount) <= DAILY_WITHDRAWAL_LIMIT,
+            "Daily withdrawal limit exceeded"
+        );
+
+        uint256 amount = stakeInfo.amount;
+        uint256 rewards = stakeInfo.pendingRewards;
+
+        // 출금 가능 여부 확인
+        require(canProcessWithdrawal(amount, rewards), "Insufficient contract balance");
+
+        // 상태 업데이트
+        stakeInfo.dailyWithdrawnAmount = stakeInfo.dailyWithdrawnAmount.add(amount);
+        stakeInfo.lastWithdrawalTime = block.timestamp;
+
+        // 총 스테이킹 금액 감소
+        totalStaked = totalStaked.sub(amount);
+
+        // 스테이커 정보 삭제
+        delete stakes[msg.sender];
+
+        // 토큰 전송
+        if (rewards > 0) {
+            gtToken.safeTransfer(msg.sender, amount.add(rewards));
+        } else {
+            gtToken.safeTransfer(msg.sender, amount);
+        }
+
+        emit Withdrawn(msg.sender, amount, rewards, block.timestamp);
+    }
+
+    // 긴급 출금 함수 (관리자용)
+    function emergencyWithdraw(address _user) external onlyRole(EMERGENCY_ROLE) {
+        StakeInfo storage stakeInfo = stakes[_user];
+        require(stakeInfo.amount > 0, "No stake found");
+
+        uint256 amount = stakeInfo.amount;
+        uint256 rewards;
+        
+        if (stakeInfo.isWithdrawing) {
+            rewards = stakeInfo.pendingRewards;
+        } else {
+            stakeInfo.withdrawalRequestTime = block.timestamp;
+            rewards = calculateRewards(_user);
+        }
+
+        // 출금 가능 여부 확인
+        require(canProcessWithdrawal(amount, rewards), "Insufficient contract balance");
+
+        // 총 스테이킹 금액 감소
+        totalStaked = totalStaked.sub(amount);
+
+        // 상태 초기화
+        delete stakes[_user];
+
+        // 토큰 전송
+        if (rewards > 0) {
+            gtToken.safeTransfer(_user, amount.add(rewards));
+        } else {
+            gtToken.safeTransfer(_user, amount);
+        }
+
+        emit EmergencyWithdrawn(_user, amount, rewards, msg.sender, block.timestamp);
+    }
+
+    // 관리자가 보상 토큰을 예치하는 함수
+    function depositRewards(uint256 _amount) external onlyRole(ADMIN_ROLE) {
+        require(_amount > 0, "Amount must be greater than 0");
+        gtToken.safeTransferFrom(msg.sender, address(this), _amount);
+        emit RewardsDeposited(msg.sender, _amount, block.timestamp);
+    }
+
+    // 관리자가 남은 보상 토큰을 회수하는 함수 (전체 스테이킹 금액 보장)
+    function withdrawRewards(uint256 _amount) external onlyRole(ADMIN_ROLE) {
+        require(_amount > 0, "Amount must be greater than 0");
+        uint256 availableRewards = gtToken.balanceOf(address(this));
+        require(availableRewards >= _amount, "Insufficient rewards balance");
+        require(availableRewards - _amount >= totalStaked, "Cannot withdraw more than available rewards");
+        gtToken.safeTransfer(msg.sender, _amount);
+        emit RewardsWithdrawn(msg.sender, _amount, block.timestamp);
+    }
+
+    // 현재 보상 토큰 잔액 조회 함수
+    function getRewardsBalance() external view returns (uint256) {
+        return gtToken.balanceOf(address(this));
+    }
+
+    // 관리자 함수
+    function pause() external onlyRole(ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(ADMIN_ROLE) {
+        _unpause();
+    }
