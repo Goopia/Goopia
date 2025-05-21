@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+/**
+ * @title Goopia Token
+ * @dev ERC20 token implementation for the Goopia project, deployed on the Polygon network.
+ * This token has a fixed supply of 21 billion tokens with enhanced security features.
+ */
+contract Goopia is ERC20, Ownable, Pausable, ReentrancyGuard {
+    // 토큰 총 발행량: 21,000,000,000 GT
+    uint256 private constant INITIAL_SUPPLY = 21000000000 * 10**18;
+    // 한 번에 처리할 수 있는 최대 에어드랍 수신자 수
+    uint256 private constant MAX_AIRDROP_BATCH_SIZE = 100;
+
+    // 에어드랍 중복 수신자 방지를 위한 매핑
+    mapping(address => bool) private airdropTracker;
+
+    // 이벤트 정의
+    event TokensBurned(address indexed burner, uint256 amount);
+    event Airdrop(address indexed recipient, uint256 amount);
+    event EmergencyWithdrawn(address indexed owner, uint256 amount);
+
+    /**
+     * @dev 컨트랙트 생성자
+     * @notice 초기 공급량을 컨트랙트 배포자에게 발행합니다.
+     */
+    constructor() ERC20("Goopia", "GT") Ownable(msg.sender) {
+        _mint(msg.sender, INITIAL_SUPPLY);
+    }
+
+    /**
+     * @dev 토큰 소각 기능
+     * @param amount 소각할 토큰 수량
+     * @notice 소각 시 토큰 공급량이 영구적으로 감소합니다.
+     */
+    function burn(uint256 amount) public onlyOwner nonReentrant {
+        require(amount <= balanceOf(msg.sender), "Burn amount exceeds balance");
+        _burn(msg.sender, amount);
+        emit TokensBurned(msg.sender, amount);
+    }
+
+    /**
+     * @dev 대량 에어드랍 기능
+     * @param recipients 에어드랍 수신자 주소 배열
+     * @param amounts 각 수신자에게 전송할 토큰 수량 배열
+     * @notice 중복 수신자 방지 및 가스 비용 최적화를 위해 배치 크기 제한
+     */
+    function bulkAirdrop(address[] calldata recipients, uint256[] calldata amounts) public onlyOwner whenNotPaused nonReentrant {
+        require(recipients.length == amounts.length, "Arrays length mismatch");
+        require(recipients.length <= MAX_AIRDROP_BATCH_SIZE, "Batch size too large");
+
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < amounts.length; i++) {
+            totalAmount = totalAmount + amounts[i];
+        }
+        require(balanceOf(msg.sender) >= totalAmount, "Insufficient balance for airdrop");
+
+        for (uint256 i = 0; i < recipients.length; i++) {
+            require(!airdropTracker[recipients[i]], "Duplicate recipient detected");
+            airdropTracker[recipients[i]] = true;
+
+            _transfer(msg.sender, recipients[i], amounts[i]);
+            emit Airdrop(recipients[i], amounts[i]);
+        }
+
+        // 에어드랍 트래커 초기화
+        for (uint256 i = 0; i < recipients.length; i++) {
+            airdropTracker[recipients[i]] = false;
+        }
+    }
+
+    /**
+     * @dev 컨트랙트 일시 중지 기능
+     * @notice 비상 상황 시 토큰 전송을 일시 중지할 수 있습니다.
+     */
+    function pause() public onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev 컨트랙트 재개 기능
+     * @notice 일시 중지된 토큰 전송을 재개합니다.
+     */
+    function unpause() public onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev 비상시 토큰 회수 기능
+     * @notice 컨트랙트에 실수로 전송된 토큰을 회수할 수 있습니다.
+     */
+    function emergencyWithdraw() public onlyOwner {
+        uint256 balance = balanceOf(address(this));
+        require(balance > 0, "No tokens to withdraw");
+        _transfer(address(this), owner(), balance);
+        emit EmergencyWithdrawn(owner(), balance);
+    }
+
+    /**
+     * @dev 우발적인 MATIC 전송 방지
+     */
+    fallback() external payable {
+        revert("Direct MATIC transfers not allowed");
+    }
+
+    /**
+     * @dev 우발적인 ETH 전송 방지
+     */
+    receive() external payable {
+        revert("Direct ETH transfers not allowed");
+    }
+
+    /**
+     * @dev 토큰 전송 시 Pause 상태 확인
+     * @notice 모든 토큰 전송 시 컨트랙트가 일시 중지 상태인지 확인합니다.
+     */
+    function _update(
+        address from,
+        address to,
+        uint256 amount
+    ) internal virtual override whenNotPaused {
+        super._update(from, to, amount);
+    }
+}
