@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract DicePredictionGame is VRFConsumerBaseV2, Ownable {
+    IERC20 public gtToken;
+    VRFCoordinatorV2Interface COORDINATOR;
+
+    uint64 public s_subscriptionId;
+    address public vrfCoordinator;
+    bytes32 public keyHash;
+    uint32 public callbackGasLimit;
+    uint16 public requestConfirmations;
+    uint32 public numWords = 1;
+
+    uint256[] public allowedBets = [500 ether, 1000 ether, 3000 ether];
+    uint256 public betTimeout = 1 hours;
+
+    enum BetStatus { Pending, Won, Lost, Cancelled, Refunded }
+
+    struct Bet {
+        address player;
+        uint256 amount;
+        uint8 prediction;
+        uint256 placedAt;
+        BetStatus status;
+        uint8 result;
+        uint256 reward;
+        uint256 requestId;
+    }
+
+    mapping(uint256 => Bet) public bets; // requestId => Bet
+    mapping(address => uint256[]) public userBets; // user => requestIds
+
+    event BetPlaced(address indexed player, uint256 indexed requestId, uint256 amount, uint8 prediction);
+    event BetSettled(address indexed player, uint256 indexed requestId, uint8 result, bool win, uint256 reward);
+    event BetCancelled(address indexed player, uint256 indexed requestId);
+    event RewardWithdrawn(address indexed owner, uint256 amount);
+    event Deposit(address indexed owner, uint256 amount);
+
+    modifier onlyCoordinator() {
+        require(msg.sender == vrfCoordinator, "Only VRFCoordinator can fulfill");
+        _;
+    }
+
+    constructor(
+        address _gtToken,
+        address _vrfCoordinator,
+        uint64 _subscriptionId,
+        bytes32 _keyHash,
+        uint32 _callbackGasLimit,
+        uint16 _requestConfirmations
+    ) VRFConsumerBaseV2(_vrfCoordinator) Ownable(msg.sender) {
+        gtToken = IERC20(_gtToken);
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
+        vrfCoordinator = _vrfCoordinator;
+        s_subscriptionId = _subscriptionId;
+        keyHash = _keyHash;
+        callbackGasLimit = _callbackGasLimit;
+        requestConfirmations = _requestConfirmations;
+    }
+
+    function isAllowedBet(uint256 amount) public view returns (bool) {
+        for (uint i = 0; i < allowedBets.length; i++) {
+            if (allowedBets[i] == amount) return true;
+        }
+        return false;
+    }
+
+    function placeBet(uint8 prediction, uint256 amount) external {
+        require(isAllowedBet(amount), "Bet amount not allowed");
+        require(prediction >= 2 && prediction <= 12, "Prediction out of range");
+
+        // 최대 보상액 기준으로 보상풀 잔고 체크
+        uint256 maxReward = getRewardAmount(prediction, amount);
+        require(gtToken.balanceOf(address(this)) >= maxReward, "Insufficient reward pool");
+
+        // GT 토큰 전송
+        require(gtToken.transferFrom(msg.sender, address(this), amount), "Token transfer failed");
+
+        // VRF 난수 요청
+        uint256 requestId = COORDINATOR.requestRandomWords(
+            keyHash,
+            s_subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            numWords
+        );
+
+        bets[requestId] = Bet({
+            player: msg.sender,
+            amount: amount,
+            prediction: prediction,
+            placedAt: block.timestamp,
+            status: BetStatus.Pending,
+            result: 0,
+            reward: 0,
+            requestId: requestId
+        });
+
+        userBets[msg.sender].push(requestId);
+
+        emit BetPlaced(msg.sender, requestId, amount, prediction);
+    }
+
+    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override onlyCoordinator {
+        Bet storage bet = bets[requestId];
+        require(bet.status == BetStatus.Pending, "Bet already settled or cancelled");
+
+        uint8 dice1 = uint8((randomWords[0] % 6) + 1);
+        uint8 dice2 = uint8(((randomWords[0] / 6) % 6) + 1);
+        uint8 result = dice1 + dice2;
+        bet.result = result;
+
+        if (result == bet.prediction) {
+            bet.status = BetStatus.Won;
+            bet.reward = getRewardAmount(result, bet.amount);
+            require(gtToken.transfer(bet.player, bet.reward), "Reward transfer failed");
+            emit BetSettled(bet.player, requestId, result, true, bet.reward);
+        } else {
+            bet.status = BetStatus.Lost;
+            emit BetSettled(bet.player, requestId, result, false, 0);
+        }
+    }
+
+    function getRewardAmount(uint8 result, uint256 amount) public pure returns (uint256) {
+        if (result == 2 || result == 12) {
+            return amount * 10;
+        } else if (result == 7 || result == 8) {
+            return (amount * 25) / 10; // 2.5배
+        } else {
+            return amount * 3;
+        }
+    }
+
+    // VRF 실패/무응답 대비 취소(1시간 후)
+    function cancelBet(uint256 requestId) external {
+        Bet storage bet = bets[requestId];
+        require(bet.player == msg.sender, "Not your bet");
+        require(bet.status == BetStatus.Pending, "Bet not pending");
+        require(block.timestamp > bet.placedAt + betTimeout, "Timeout not reached");
+
+        bet.status = BetStatus.Cancelled;
+        require(gtToken.transfer(bet.player, bet.amount), "Refund failed");
+        emit BetCancelled(bet.player, requestId);
+    }
+
+    // 오너가 보상풀에 GT 토큰 입금
+    function deposit(uint256 amount) external onlyOwner {
+        require(gtToken.transferFrom(msg.sender, address(this), amount), "Deposit failed");
+        emit Deposit(msg.sender, amount);
+    }
+
+    // 오너가 보상풀에서 GT 토큰 출금
+    function withdraw(uint256 amount) external onlyOwner {
+        require(gtToken.balanceOf(address(this)) >= amount, "Insufficient balance");
+        require(gtToken.transfer(msg.sender, amount), "Withdraw failed");
+        emit RewardWithdrawn(msg.sender, amount);
+    }
+
+    // 유저별 베팅 이력 조회
+    function getUserBets(address user) external view returns (uint256[] memory) {
+        return userBets[user];
+    }
+
+    // 베팅 상세 조회
+    function getBet(uint256 requestId) external view returns (Bet memory) {
+        return bets[requestId];
+    }
+}
