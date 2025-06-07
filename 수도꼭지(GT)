@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title GT Token Faucet
+ * @dev 피드백 반영: 쿨다운 유연성, 봇/컨트랙트 호출 방지, 잔액조회, 이벤트, 보안 강화
+ */
+contract GTFaucet is Ownable, ReentrancyGuard, Pausable {
+    IERC20 public immutable gtToken;
+    uint256 public amountPerRequest = 50 * 10**18; // 50 GT (owner가 변경 가능)
+    uint256 public cooldownPeriod = 25 hours; // owner가 변경 가능
+    uint256 public constant MIN_COOLDOWN = 1 hours;
+    uint256 public constant MAX_COOLDOWN = 168 hours; // 7일
+
+    mapping(address => uint256) public lastRequestTime;
+
+    event TokensRequested(address indexed recipient, uint256 amount, uint256 timestamp);
+    event FaucetPaused(address indexed pauser, uint256 timestamp);
+    event FaucetUnpaused(address indexed unpauser, uint256 timestamp);
+    event FaucetRefilled(address indexed refiller, uint256 amount, uint256 timestamp);
+    event FaucetEmptied(address indexed owner, uint256 amount, uint256 timestamp);
+    event CooldownPeriodChanged(uint256 newCooldown, uint256 timestamp);
+    event AmountPerRequestChanged(uint256 newAmount, uint256 timestamp);
+
+    constructor(address _gtTokenAddress) Ownable(msg.sender) {
+        require(_gtTokenAddress != address(0), "Invalid token address");
+        gtToken = IERC20(_gtTokenAddress);
+    }
+
+    // 봇/컨트랙트 호출 방지 (EOA만 허용)
+    modifier onlyEOA() {
+        require(msg.sender == tx.origin, "Contract call not allowed");
+        _;
+    }
+
+    // 토큰 청구
+    function requestTokens() external nonReentrant whenNotPaused onlyEOA {
+        require(
+            block.timestamp >= lastRequestTime[msg.sender] + cooldownPeriod,
+            "Must wait for cooldown period"
+        );
+        require(
+            gtToken.balanceOf(address(this)) >= amountPerRequest,
+            "Faucet is empty"
+        );
+        lastRequestTime[msg.sender] = block.timestamp;
+        bool success = gtToken.transfer(msg.sender, amountPerRequest);
+        require(success, "Transfer failed");
+        emit TokensRequested(msg.sender, amountPerRequest, block.timestamp);
+    }
+
+    // 수도꼭지에 토큰 보충
+    function refillFaucet(uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount must be greater than 0");
+        bool success = gtToken.transferFrom(msg.sender, address(this), amount);
+        require(success, "Transfer failed");
+        emit FaucetRefilled(msg.sender, amount, block.timestamp);
+    }
+
+    // 남은 토큰 회수
+    function withdrawTokens(uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount must be greater than 0");
+        require(amount <= gtToken.balanceOf(address(this)), "Insufficient balance");
+        bool success = gtToken.transfer(owner(), amount);
+        require(success, "Transfer failed");
+        emit FaucetEmptied(msg.sender, amount, block.timestamp);
+    }
+
+    // 쿨다운 주기 변경 (owner만)
+    function setCooldownPeriod(uint256 _cooldown) external onlyOwner {
+        require(_cooldown >= MIN_COOLDOWN && _cooldown <= MAX_COOLDOWN, "Unreasonable period");
+        cooldownPeriod = _cooldown;
+        emit CooldownPeriodChanged(_cooldown, block.timestamp);
+    }
+
+    // 1회 지급량 변경 (owner만)
+    function setAmountPerRequest(uint256 _amount) external onlyOwner {
+        require(_amount > 0, "Amount must be greater than 0");
+        amountPerRequest = _amount;
+        emit AmountPerRequestChanged(_amount, block.timestamp);
+    }
+
+    // 수도꼭지 잔액 조회
+    function faucetBalance() external view returns (uint256) {
+        return gtToken.balanceOf(address(this));
+    }
+
+    // 일시 중지/재개
+    function pause() external onlyOwner {
+        _pause();
+        emit FaucetPaused(msg.sender, block.timestamp);
+    }
+    function unpause() external onlyOwner {
+        _unpause();
+        emit FaucetUnpaused(msg.sender, block.timestamp);
+    }
+
+    // 우발적 MATIC/ETH 전송 방지
+    fallback() external payable { revert("Direct MATIC transfers not allowed"); }
+    receive() external payable { revert("Direct ETH transfers not allowed"); }
+}
